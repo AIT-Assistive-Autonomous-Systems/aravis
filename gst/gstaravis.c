@@ -70,6 +70,26 @@ gst_aravis_buffer_data_free (gpointer user_data)
 	g_free (data);
 }
 
+/* An ArvBuffer filled in place in a buffer of the downstream pool. The
+ * GstBuffer stays mapped while the stream owns the ArvBuffer; create() unmaps
+ * it and passes the GstBuffer downstream, which returns it to its pool. */
+typedef struct {
+	GstBuffer *buffer;
+	GstMapInfo map;
+} GstAravisPoolData;
+
+static void
+gst_aravis_pool_data_free (gpointer user_data)
+{
+	GstAravisPoolData *data = user_data;
+
+	if (data->buffer != NULL) {
+		gst_buffer_unmap (data->buffer, &data->map);
+		gst_buffer_unref (data->buffer);	/* back to its pool */
+	}
+	g_free (data);
+}
+
 GST_DEBUG_CATEGORY_STATIC (aravis_debug);
 #define GST_CAT_DEFAULT aravis_debug
 
@@ -96,6 +116,7 @@ enum
   PROP_STREAM,
   PROP_TRIGGER,
   PROP_ADD_REFERENCE_TIMESTAMP_META,
+  PROP_USE_DOWNSTREAM_POOL,
   N_PROPERTIES
 };
 
@@ -248,6 +269,50 @@ gst_aravis_get_caps (GstBaseSrc * src, GstCaps * filter)
 	return caps;
 }
 
+/* A buffer for the stream: one of the downstream pool when there is one and
+ * it has a free buffer now, else an own one (the stream never waits for
+ * downstream). Called with the object lock held. */
+static ArvBuffer *
+gst_aravis_new_stream_buffer (GstAravis *gst_aravis)
+{
+	GstBufferPoolAcquireParams params = { .flags = GST_BUFFER_POOL_ACQUIRE_FLAG_DONTWAIT };
+	GstAravisPoolData *data;
+	GstBuffer *buffer = NULL;
+
+	if (gst_aravis->pool == NULL ||
+	    gst_buffer_pool_acquire_buffer (gst_aravis->pool, &buffer, &params) != GST_FLOW_OK)
+		return arv_buffer_new (gst_aravis->payload, NULL);
+
+	data = g_new0 (GstAravisPoolData, 1);
+	if (gst_buffer_get_size (buffer) < (gsize) gst_aravis->payload ||
+	    !gst_buffer_map (buffer, &data->map, GST_MAP_WRITE)) {
+		gst_buffer_unref (buffer);
+		g_free (data);
+		return arv_buffer_new (gst_aravis->payload, NULL);
+	}
+	data->buffer = buffer;
+
+	return arv_buffer_new_full (gst_aravis->payload, data->map.data, data, gst_aravis_pool_data_free);
+}
+
+/* Fill the stream with buffers and start the acquisition. Called with the
+ * object lock held. */
+static void
+gst_aravis_start_stream (GstAravis *gst_aravis, GError **error)
+{
+	unsigned int i;
+
+	for (i = 0; i < gst_aravis->num_arv_buffers; i++)
+		arv_stream_push_buffer (gst_aravis->stream, gst_aravis_new_stream_buffer (gst_aravis));
+
+	GST_LOG_OBJECT (gst_aravis, "Start acquisition");
+	arv_camera_start_acquisition (gst_aravis->camera, error);
+
+	gst_aravis->timestamp_offset = 0;
+	gst_aravis->last_timestamp = 0;
+	gst_aravis->start_pending = FALSE;
+}
+
 static gboolean
 gst_aravis_set_caps (GstBaseSrc *src, GstCaps *caps)
 {
@@ -260,7 +325,6 @@ gst_aravis_set_caps (GstBaseSrc *src, GstCaps *caps)
 	int depth = 0, bpp = 0;
 	const GValue *frame_rate = NULL;
 	const char *format_string;
-	unsigned int i;
 	ArvStream *orig_stream = NULL;
 	gboolean result = FALSE;
 	gboolean is_frame_rate_available;
@@ -398,15 +462,17 @@ gst_aravis_set_caps (GstBaseSrc *src, GstCaps *caps)
 			g_object_set (gst_aravis->stream, "packet-resend", ARV_GV_STREAM_PACKET_RESEND_NEVER, NULL);
 	}
 
-	for (i = 0; i < gst_aravis->num_arv_buffers; i++)
-		arv_stream_push_buffer (gst_aravis->stream,
-					arv_buffer_new (gst_aravis->payload, NULL));
+	gst_aravis->row_stride = width * ARV_PIXEL_FORMAT_BIT_PER_PIXEL (pixel_format) / 8;
+	gst_aravis->height = height;
+	g_clear_object (&gst_aravis->pool);	/* renegotiation: decide_allocation picks again */
 
-	GST_LOG_OBJECT (gst_aravis, "Start acquisition");
-	arv_camera_start_acquisition (gst_aravis->camera, &error);
-
-	gst_aravis->timestamp_offset = 0;
-	gst_aravis->last_timestamp = 0;
+	if (gst_aravis->use_downstream_pool) {
+		/* Buffers come from the pool decide_allocation receives next
+		 * (GstBaseSrc negotiates caps, then allocation). */
+		gst_aravis->start_pending = TRUE;
+	} else {
+		gst_aravis_start_stream (gst_aravis, &error);
+	}
 
 	if (error)
 		goto errored;
@@ -434,6 +500,83 @@ unref:
 	if (orig_stream != NULL)
 		g_object_unref (orig_stream);
 	return result;
+}
+
+/* use-downstream-pool: take the pool downstream proposes, when its buffers
+ * hold a frame as one contiguous block with GStreamer's row stride (no row
+ * padding), and fill the stream with its buffers. Otherwise own buffers. */
+static gboolean
+gst_aravis_decide_allocation (GstBaseSrc *src, GstQuery *query)
+{
+	GstAravis *gst_aravis = GST_ARAVIS (src);
+	GstBufferPool *pool = NULL;
+	GError *error = NULL;
+	guint size = 0, min = 0, max = 0;
+
+	if (!GST_BASE_SRC_CLASS (gst_aravis_parent_class)->decide_allocation (src, query))
+		return FALSE;
+
+	GST_OBJECT_LOCK (gst_aravis);
+	if (!gst_aravis->start_pending) {
+		GST_OBJECT_UNLOCK (gst_aravis);
+		return TRUE;
+	}
+
+	if (gst_query_get_n_allocation_pools (query) > 0)
+		gst_query_parse_nth_allocation_pool (query, 0, &pool, &size, &min, &max);
+
+	if (pool == NULL) {
+		GST_INFO_OBJECT (gst_aravis, "No downstream pool: own buffers");
+	} else if ((gst_aravis->row_stride & 0x3) != 0) {
+		/* GStreamer's default stride pads rows to 4 bytes; the camera's
+		 * rows are packed. */
+		GST_INFO_OBJECT (gst_aravis, "Row stride %d not a multiple of 4: own buffers",
+				 gst_aravis->row_stride);
+		g_clear_object (&pool);
+	} else if (!gst_buffer_pool_set_active (pool, TRUE)) {
+		GST_WARNING_OBJECT (gst_aravis, "Could not activate the downstream pool: own buffers");
+		g_clear_object (&pool);
+	} else {
+		GstBuffer *probe = NULL;
+		GstBufferPoolAcquireParams params = { .flags = GST_BUFFER_POOL_ACQUIRE_FLAG_DONTWAIT };
+		gboolean usable = FALSE;
+
+		/* One block of at least a payload, writable, packed rows. */
+		if (gst_buffer_pool_acquire_buffer (pool, &probe, &params) == GST_FLOW_OK) {
+			GstMapInfo map;
+
+			if (gst_buffer_n_memory (probe) == 1 &&
+			    gst_buffer_get_size (probe) >= (gsize) gst_aravis->payload &&
+			    gst_buffer_map (probe, &map, GST_MAP_WRITE)) {
+				usable = TRUE;
+				gst_buffer_unmap (probe, &map);
+			}
+			gst_buffer_unref (probe);
+		}
+		if (usable) {
+			GST_INFO_OBJECT (gst_aravis, "Stream buffers from the downstream pool %" GST_PTR_FORMAT, pool);
+		} else {
+			GST_WARNING_OBJECT (gst_aravis, "Downstream pool %" GST_PTR_FORMAT
+					    " has no contiguous, writable buffers of %d bytes: own buffers",
+					    pool, gst_aravis->payload);
+			g_clear_object (&pool);
+		}
+	}
+
+	gst_aravis->pool = pool;	/* our reference */
+	gst_aravis_start_stream (gst_aravis, &error);
+	GST_OBJECT_UNLOCK (gst_aravis);
+
+	if (error) {
+		GST_ELEMENT_ERROR (gst_aravis, RESOURCE, WRITE,
+				   (_("Could not start acquisition on camera \"%s\": %s"),
+				    gst_aravis->camera_name ? gst_aravis->camera_name : "", error->message),
+				   (NULL));
+		g_error_free (error);
+		return FALSE;
+	}
+
+	return TRUE;
 }
 
 static void
@@ -545,9 +688,13 @@ gst_aravis_stop( GstBaseSrc * src )
 	GST_OBJECT_UNLOCK (gst_aravis);
 
 	if (stream != NULL)
-		g_object_unref (stream);
+		g_object_unref (stream);	/* returns its pool buffers */
 	if (camera != NULL)
 		g_object_unref (camera);
+	GST_OBJECT_LOCK (gst_aravis);
+	g_clear_object (&gst_aravis->pool);
+	gst_aravis->start_pending = FALSE;
+	GST_OBJECT_UNLOCK (gst_aravis);
 	if (all_caps != NULL)
 		gst_caps_unref (all_caps);
 
@@ -618,8 +765,19 @@ gst_aravis_create (GstPushSrc * push_src, GstBuffer ** buffer)
 	arv_row_stride = width * ARV_PIXEL_FORMAT_BIT_PER_PIXEL (arv_buffer_get_image_pixel_format (arv_buffer)) / 8;
 	timestamp_ns = arv_buffer_get_timestamp (arv_buffer);
 
+	if (arv_buffer_get_user_data (arv_buffer) != NULL) {
+		/* Filled in place in a downstream pool buffer: pass that buffer on
+		 * and give the stream a new one. */
+		GstAravisPoolData *data = (GstAravisPoolData *) arv_buffer_get_user_data (arv_buffer);
+		GstBuffer *pooled = g_steal_pointer (&data->buffer);
+
+		gst_buffer_unmap (pooled, &data->map);
+		gst_buffer_set_size (pooled, buffer_size);
+		g_clear_object (&arv_buffer);	/* frees data, not the memory */
+		arv_stream_push_buffer (gst_aravis->stream, gst_aravis_new_stream_buffer (gst_aravis));
+		*buffer = pooled;
+	} else if ((arv_row_stride & 0x3) != 0) {
 	/* Gstreamer requires row stride to be a multiple of 4 */
-	if ((arv_row_stride & 0x3) != 0) {
 		int gst_row_stride;
 		size_t size;
 		char *data;
@@ -901,6 +1059,11 @@ gst_aravis_set_property (GObject * object, guint prop_id,
                 case PROP_NUM_ARV_BUFFERS:
                         gst_aravis->num_arv_buffers = g_value_get_int (value);
                         break;
+                case PROP_USE_DOWNSTREAM_POOL:
+                        GST_OBJECT_LOCK (gst_aravis);
+                        gst_aravis->use_downstream_pool = g_value_get_boolean (value);
+                        GST_OBJECT_UNLOCK (gst_aravis);
+                        break;
                 case PROP_USB_MODE:
                         gst_aravis->usb_mode = g_value_get_enum (value);
                         break;
@@ -1014,6 +1177,9 @@ gst_aravis_get_property (GObject * object, guint prop_id, GValue * value,
 			break;
 		case PROP_NUM_ARV_BUFFERS:
 			g_value_set_int (value, gst_aravis->num_arv_buffers);
+			break;
+		case PROP_USE_DOWNSTREAM_POOL:
+			g_value_set_boolean (value, gst_aravis->use_downstream_pool);
 			break;
 		case PROP_USB_MODE:
 			g_value_set_enum(value, gst_aravis->usb_mode);
@@ -1209,6 +1375,16 @@ gst_aravis_class_init (GstAravisClass * klass)
 				  "Number of video buffers to allocate for video frames",
 				  1, G_MAXINT, GST_ARAVIS_DEFAULT_N_BUFFERS,
 				  G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS);
+	properties[PROP_USE_DOWNSTREAM_POOL] =
+		g_param_spec_boolean ("use-downstream-pool",
+				      "Use the downstream buffer pool",
+				      "Receive frames directly into buffers of the pool downstream proposes "
+				      "(allocation query), e.g. memory the next element reads without a copy. "
+				      "The pool's buffers must hold a frame as one contiguous, writable block "
+				      "with rows packed; otherwise, or without a pool, own buffers are used. "
+				      "When the pool has no free buffer, an own buffer is used for that frame.",
+				      FALSE,
+				      G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS);
 	properties[PROP_USB_MODE] =
 		g_param_spec_enum ("usb-mode",
 				   "USB mode",
@@ -1263,6 +1439,7 @@ gst_aravis_class_init (GstAravisClass * klass)
 	gstbasesrc_class->fixate = GST_DEBUG_FUNCPTR (gst_aravis_fixate_caps);
 	gstbasesrc_class->start = GST_DEBUG_FUNCPTR (gst_aravis_start);
 	gstbasesrc_class->stop = GST_DEBUG_FUNCPTR (gst_aravis_stop);
+	gstbasesrc_class->decide_allocation = GST_DEBUG_FUNCPTR (gst_aravis_decide_allocation);
 	gstbasesrc_class->query = GST_DEBUG_FUNCPTR (gst_aravis_query);
 
 	gstbasesrc_class->get_times = GST_DEBUG_FUNCPTR (gst_aravis_get_times);

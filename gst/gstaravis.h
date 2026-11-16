@@ -87,6 +87,13 @@ struct _GstAravis {
 	char *features;
 
 	gboolean add_reference_timestamp_meta;
+
+	/* Stream buffers from the downstream pool (use-downstream-pool) */
+	gboolean use_downstream_pool;
+	GstBufferPool *pool;		/* active downstream pool, NULL: own buffers */
+	gboolean start_pending;		/* set_caps left buffers and acquisition to decide_allocation */
+	gint row_stride;		/* bytes per row of the negotiated format */
+	gint height;
 };
 
 struct _GstAravisClass {
