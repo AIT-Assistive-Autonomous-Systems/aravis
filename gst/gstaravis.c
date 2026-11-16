@@ -502,6 +502,41 @@ unref:
 	return result;
 }
 
+/* Downstream sizes its proposal from the caps (the image). The camera's
+ * payload can be larger: chunk data, device padding. As the element deciding
+ * the allocation, configure the pool for at least a payload. */
+static gboolean
+gst_aravis_size_pool (GstAravis *gst_aravis, GstBufferPool *pool, GstQuery *query,
+		      guint size, guint min, guint max)
+{
+	GstStructure *config;
+	GstCaps *caps = NULL;
+	guint needed = MAX (size, (guint) gst_aravis->payload);
+
+	if (gst_buffer_pool_is_active (pool))
+		return size >= (guint) gst_aravis->payload;	/* can't reconfigure */
+
+	gst_query_parse_allocation (query, &caps, NULL);
+	config = gst_buffer_pool_get_config (pool);
+	gst_buffer_pool_config_set_params (config, caps, needed, min, max);
+	if (!gst_buffer_pool_set_config (pool, config)) {
+		/* The pool may adjust the parameters; accept them if they still fit. */
+		config = gst_buffer_pool_get_config (pool);
+		if (!gst_buffer_pool_config_validate_params (config, caps, needed, min, max)) {
+			gst_structure_free (config);
+			return FALSE;
+		}
+		if (!gst_buffer_pool_set_config (pool, config))
+			return FALSE;
+	}
+	gst_query_set_nth_allocation_pool (query, 0, pool, needed, min, max);
+	if (needed != size)
+		GST_INFO_OBJECT (gst_aravis, "Downstream pool buffers enlarged from %u to the payload, %u bytes",
+				 size, needed);
+
+	return TRUE;
+}
+
 /* use-downstream-pool: take the pool downstream proposes, when its buffers
  * hold a frame as one contiguous block with GStreamer's row stride (no row
  * padding), and fill the stream with its buffers. Otherwise own buffers. */
@@ -532,6 +567,10 @@ gst_aravis_decide_allocation (GstBaseSrc *src, GstQuery *query)
 		 * rows are packed. */
 		GST_INFO_OBJECT (gst_aravis, "Row stride %d not a multiple of 4: own buffers",
 				 gst_aravis->row_stride);
+		g_clear_object (&pool);
+	} else if (!gst_aravis_size_pool (gst_aravis, pool, query, size, min, max)) {
+		GST_WARNING_OBJECT (gst_aravis, "Downstream pool %" GST_PTR_FORMAT
+				    " can't hold a payload of %d bytes: own buffers", pool, gst_aravis->payload);
 		g_clear_object (&pool);
 	} else if (!gst_buffer_pool_set_active (pool, TRUE)) {
 		GST_WARNING_OBJECT (gst_aravis, "Could not activate the downstream pool: own buffers");

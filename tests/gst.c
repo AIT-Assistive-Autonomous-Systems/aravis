@@ -283,6 +283,78 @@ downstream_pool_test (void)
         g_assert_cmpint (count.n_ramp, ==, count.n_frames);
 }
 
+/* A proposal smaller than the camera's payload (as with chunk data, which
+ * downstream can't know from the caps): aravissrc enlarges the pool's buffers
+ * instead of falling back to its own. */
+static GstPadProbeReturn
+shrink_proposal (GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
+{
+        GstQuery *query = GST_PAD_PROBE_INFO_QUERY (info);
+        GstBufferPool *pool = NULL;
+        guint size, min, max;
+
+        if (GST_QUERY_TYPE (query) != GST_QUERY_ALLOCATION ||
+            gst_query_get_n_allocation_pools (query) == 0)
+                return GST_PAD_PROBE_OK;
+        gst_query_parse_nth_allocation_pool (query, 0, &pool, &size, &min, &max);
+        if (pool != NULL) {
+                /* Like nvdebayer: a plain pool, sized smaller than the payload */
+                GstBufferPool *plain = gst_buffer_pool_new ();
+                GstStructure *config = gst_buffer_pool_get_config (plain);
+                GstCaps *caps = NULL;
+
+                gst_query_parse_allocation (query, &caps, NULL);
+                gst_buffer_pool_config_set_params (config, caps, size / 2, min, max);
+                g_assert_true (gst_buffer_pool_set_config (plain, config));
+                gst_query_set_nth_allocation_pool (query, 0, plain, size / 2, min, max);
+                gst_object_unref (plain);
+                gst_object_unref (pool);
+        }
+
+        return GST_PAD_PROBE_OK;
+}
+
+static void
+downstream_pool_small_proposal_test (void)
+{
+        GstElement *pipeline = gst_pipeline_new ("pool-small");
+        GstElement *source = make_source ("pool-small-source");
+        GstElement *rest, *sink;
+        PoolCount count = { 0 };
+        GError *error = NULL;
+        GstPad *pad;
+        int i;
+
+        g_object_set (source, "num-arv-buffers", 4, "use-downstream-pool", TRUE, NULL);
+        rest = gst_parse_bin_from_description ("videoconvert ! video/x-raw,format=RGBA ! appsink name=sink sync=false",
+                                               TRUE, &error);
+        g_assert_no_error (error);
+        gst_bin_add_many (GST_BIN (pipeline), source, rest, NULL);
+        g_assert_true (gst_element_link (source, rest));
+        sink = gst_bin_get_by_name (GST_BIN (rest), "sink");
+
+        pad = gst_element_get_static_pad (source, "src");
+        gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_QUERY_DOWNSTREAM | GST_PAD_PROBE_TYPE_PULL,
+                           shrink_proposal, NULL, NULL);
+        gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_BUFFER, count_pool_buffers, &count, NULL);
+        gst_object_unref (pad);
+
+        g_assert_cmpint (gst_element_set_state (pipeline, GST_STATE_PLAYING), !=, GST_STATE_CHANGE_FAILURE);
+        for (i = 0; i < 10; i++) {
+                GstSample *sample = gst_app_sink_try_pull_sample (GST_APP_SINK (sink), 3 * GST_SECOND);
+
+                g_assert_nonnull (sample);
+                gst_sample_unref (sample);
+        }
+        g_assert_cmpint (gst_element_set_state (pipeline, GST_STATE_NULL), ==, GST_STATE_CHANGE_SUCCESS);
+        gst_object_unref (sink);
+        gst_object_unref (pipeline);
+
+        g_assert_cmpint (count.n_frames, >=, 10);
+        g_assert_cmpint (count.n_from_pool, ==, count.n_frames);
+        g_assert_cmpint (count.n_ramp, ==, count.n_frames);
+}
+
 static void
 downstream_pool_fallback_test (void)
 {
@@ -310,6 +382,7 @@ main (int argc, char *argv[])
 
 	g_test_add_func ("/gst/swap-source-test", swap_source_test);
 	g_test_add_func ("/gst/downstream-pool", downstream_pool_test);
+	g_test_add_func ("/gst/downstream-pool-small-proposal", downstream_pool_small_proposal_test);
 	g_test_add_func ("/gst/downstream-pool-fallback", downstream_pool_fallback_test);
 
 	result = g_test_run();
