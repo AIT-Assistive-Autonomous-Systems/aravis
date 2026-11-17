@@ -87,6 +87,12 @@ struct _GstAravis {
 	char *features;
 
 	gboolean add_reference_timestamp_meta;
+
+	guint ptp_wait_s;
+	guint ptp_max_offset_ms;
+	char *ptp_enable;
+	char *ptp_status;
+	char *ptp_time;
 };
 
 struct _GstAravisClass {

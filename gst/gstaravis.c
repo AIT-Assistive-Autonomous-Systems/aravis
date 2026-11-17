@@ -47,6 +47,9 @@
 
 #define GST_ARAVIS_DEFAULT_N_BUFFERS		50
 #define GST_ARAVIS_BUFFER_TIMEOUT_DEFAULT	2000000
+#define GST_ARAVIS_DEFAULT_PTP_MAX_OFFSET_MS	1000
+/* TAI - UTC since 2017, when the kernel's TAI offset is not set */
+#define GST_ARAVIS_TAI_UTC_OFFSET_S		37
 
 typedef struct {
 	GWeakRef stream;
@@ -96,6 +99,11 @@ enum
   PROP_STREAM,
   PROP_TRIGGER,
   PROP_ADD_REFERENCE_TIMESTAMP_META,
+  PROP_PTP_WAIT,
+  PROP_PTP_MAX_OFFSET,
+  PROP_PTP_ENABLE,
+  PROP_PTP_STATUS,
+  PROP_PTP_TIME,
   N_PROPERTIES
 };
 
@@ -498,6 +506,333 @@ gst_aravis_init_error (GstAravis *gst_aravis, GError *error)
 	g_error_free (error);
 }
 
+/* PTP (ptp-enable, ptp-wait): set the camera's PTP mode, then wait until its status says
+ * synchronized (ptp-status) and its clock agrees with the host's (ptp-time). Status alone is not
+ * enough: right after PTP is enabled (power-up, reset), a camera can report Slave before its clock
+ * is stepped. The modes and "auto" use the ArvCamera PTP functions, which know the usual feature
+ * sets (see the PTP page of the aravis documentation); explicit settings use the syntax of the
+ * features property:
+ *   ptp-enable  "no" (leave PTP as it is), "off", "auto", "slave", "master", or assignments and
+ *               commands, e.g. "GevIEEE1588Mode=SlaveOnly GevIEEE1588=true"
+ *   ptp-status  "auto" (Slave, Master, or either, after the requested mode), "" (no status
+ *               check), or commands (latches) and one Feature=Value condition, e.g.
+ *               "PtpDataSetLatch PtpStatus=Slave"
+ *   ptp-time    "auto", "" (no clock check), or commands (latches) and the integer feature holding
+ *               the time in ns, e.g. "TimestampLatch TimestampLatchValue" */
+
+#define GST_ARAVIS_PTP_AUTO "auto"
+#define GST_ARAVIS_PTP_NO "no"
+
+static gboolean
+gst_aravis_ptp_is (const char *setting, const char *value)
+{
+	return setting != NULL && g_ascii_strcasecmp (setting, value) == 0;
+}
+
+/* ptp-enable keyword: TRUE and *mode for off/auto/slave/master */
+static gboolean
+gst_aravis_ptp_enable_mode (const char *setting, ArvPtpMode *mode)
+{
+	static const struct { const char *name; ArvPtpMode mode; } modes[] = {
+		{"off", ARV_PTP_MODE_OFF}, {"auto", ARV_PTP_MODE_AUTO},
+		{"slave", ARV_PTP_MODE_SLAVE}, {"master", ARV_PTP_MODE_MASTER}
+	};
+	guint i;
+
+	for (i = 0; i < G_N_ELEMENTS (modes); i++)
+		if (gst_aravis_ptp_is (setting, modes[i].name)) {
+			*mode = modes[i].mode;
+			return TRUE;
+		}
+	return FALSE;
+}
+
+static gboolean
+gst_aravis_ptp_enable_is_no (const char *setting)
+{
+	return setting == NULL || setting[0] == '\0' || gst_aravis_ptp_is (setting, GST_ARAVIS_PTP_NO);
+}
+
+/* runs the commands of an explicit ptp-status / ptp-time setting; returns the remaining token
+ * (the condition or the value feature), to be freed */
+static char *
+gst_aravis_ptp_run_commands (ArvDevice *device, const char *setting, GError **error)
+{
+	char **tokens = g_strsplit_set (setting, " \t", -1);
+	char *last = NULL;
+	guint i;
+
+	for (i = 0; tokens[i] != NULL; i++) {
+		if (tokens[i][0] == '\0')
+			continue;
+		if (last != NULL) {
+			arv_device_execute_command (device, last, error);
+			g_free (last);
+			last = NULL;
+			if (error != NULL && *error != NULL)
+				break;
+		}
+		last = g_strdup (tokens[i]);
+	}
+	g_strfreev (tokens);
+	if (error != NULL && *error != NULL)
+		g_clear_pointer (&last, g_free);
+	return last;
+}
+
+/* status condition. auto: Slave, Master or either (expect_slave / expect_master); *status is set
+ * to the value read (to be freed), *is_slave whether it is Slave (auto only) */
+static gboolean
+gst_aravis_ptp_status_ok (ArvCamera *camera, const char *setting, gboolean expect_slave,
+			  gboolean expect_master, char **status, gboolean *is_slave, GError **error)
+{
+	ArvDevice *device = arv_camera_get_device (camera);
+	const char *value;
+	char *condition = NULL, *eq;
+	gboolean ok;
+
+	*is_slave = FALSE;
+	if (gst_aravis_ptp_is (setting, GST_ARAVIS_PTP_AUTO)) {
+		value = arv_camera_get_ptp_status (camera, error);
+		*is_slave = g_strcmp0 (value, "Slave") == 0;
+		ok = (expect_slave && *is_slave) || (expect_master && g_strcmp0 (value, "Master") == 0);
+		*status = value != NULL ? g_strdup (value) : NULL;
+		return ok;
+	}
+
+	condition = gst_aravis_ptp_run_commands (device, setting, error);
+	if (condition == NULL || (eq = strchr (condition, '=')) == NULL) {
+		if (error != NULL && *error == NULL)
+			g_set_error (error, ARV_DEVICE_ERROR, ARV_DEVICE_ERROR_INVALID_PARAMETER,
+				     "ptp-status \"%s\": no Feature=Value condition", setting);
+		g_free (condition);
+		*status = NULL;
+		return FALSE;
+	}
+	*eq = '\0';
+	value = arv_device_get_string_feature_value (device, condition, error);
+	ok = value != NULL && g_ascii_strcasecmp (value, eq + 1) == 0;
+	*status = value != NULL ? g_strdup_printf ("%s=%s", condition, value) : NULL;
+	g_free (condition);
+	return ok;
+}
+
+static gint64
+gst_aravis_real_time_ns (void)
+{
+	struct timespec ts;
+
+	clock_gettime (CLOCK_REALTIME, &ts);
+	return (gint64) ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+
+/* TAI - UTC in ns: the kernel's TAI offset if set (ptp4l/phc2sys), else the current leap
+ * second count */
+static gint64
+gst_aravis_tai_offset_ns (void)
+{
+#ifdef CLOCK_TAI
+	struct timespec tai, utc;
+
+	clock_gettime (CLOCK_TAI, &tai);
+	clock_gettime (CLOCK_REALTIME, &utc);
+	if (tai.tv_sec - utc.tv_sec >= 10)
+		return (gint64) (tai.tv_sec - utc.tv_sec) * 1000000000;
+#endif
+	return (gint64) GST_ARAVIS_TAI_UTC_OFFSET_S * 1000000000;
+}
+
+/* camera clock - host clock (UTC, or TAI as PTP defines it, whichever is closer) in ns; the
+ * latch happens between the two host readings, which bound the result */
+static gboolean
+gst_aravis_ptp_clock_offset (ArvCamera *camera, const char *setting,
+			     gint64 *offset_ns, gboolean *tai, GError **error)
+{
+	ArvDevice *device = arv_camera_get_device (camera);
+	gint64 t0, t1, cam = 0, diff, tai_offset = gst_aravis_tai_offset_ns ();
+	GError *local_error = NULL;
+	char *feature = NULL;
+
+	t0 = gst_aravis_real_time_ns ();
+	if (gst_aravis_ptp_is (setting, GST_ARAVIS_PTP_AUTO))
+		cam = arv_camera_get_latched_timestamp (camera, &local_error);
+	else {
+		feature = gst_aravis_ptp_run_commands (device, setting, &local_error);
+		if (feature != NULL)
+			cam = arv_device_get_integer_feature_value (device, feature, &local_error);
+		else if (local_error == NULL)
+			g_set_error (&local_error, ARV_DEVICE_ERROR, ARV_DEVICE_ERROR_INVALID_PARAMETER,
+				     "ptp-time \"%s\": no time feature", setting);
+	}
+	t1 = gst_aravis_real_time_ns ();
+	g_free (feature);
+	if (local_error) {
+		g_propagate_error (error, local_error);
+		return FALSE;
+	}
+
+	diff = cam < t0 ? cam - t0 : (cam > t1 ? cam - t1 : 0);
+	*tai = ABS (diff - tai_offset) < ABS (diff);
+	*offset_ns = *tai ? diff - tai_offset : diff;
+	return TRUE;
+}
+
+/* ptp-enable as a mode: set it, failing if the camera can't (no known PTP features, mode not
+ * available) */
+static gboolean
+gst_aravis_ptp_set_mode (GstAravis *gst_aravis, ArvCamera *camera, ArvPtpMode mode)
+{
+	GError *error = NULL;
+
+	if (!arv_camera_is_ptp_available (camera, NULL)) {
+		GST_ELEMENT_ERROR (gst_aravis, RESOURCE, SETTINGS,
+				   (_("ptp-enable=%s: the camera has no known PTP features (set ptp-enable to"
+				      " its features, e.g. \"PtpEnable=true\")"), arv_ptp_mode_to_string (mode)),
+				   (NULL));
+		return FALSE;
+	}
+	if (!arv_camera_is_ptp_mode_available (camera, mode, &error)) {
+		GST_ELEMENT_ERROR (gst_aravis, RESOURCE, SETTINGS,
+				   (_("ptp-enable=%s: PTP mode not available on this camera%s%s"),
+				    arv_ptp_mode_to_string (mode), error != NULL ? ": " : "",
+				    error != NULL ? error->message : ""), (NULL));
+		g_clear_error (&error);
+		return FALSE;
+	}
+	if (arv_camera_get_ptp_mode (camera, NULL) != mode)
+		GST_INFO_OBJECT (gst_aravis, "ptp-enable: PTP mode %s", arv_ptp_mode_to_string (mode));
+	arv_camera_set_ptp_mode (camera, mode, &error);
+	if (error != NULL) {
+		GST_ELEMENT_ERROR (gst_aravis, RESOURCE, SETTINGS,
+				   (_("ptp-enable=%s: %s"), arv_ptp_mode_to_string (mode), error->message), (NULL));
+		g_error_free (error);
+		return FALSE;
+	}
+	return TRUE;
+}
+
+/* ptp-enable and ptp-wait at start */
+static gboolean
+gst_aravis_ptp_start (GstAravis *gst_aravis, ArvCamera *camera, guint timeout_s, guint max_offset_ms,
+		      const char *enable, const char *status_setting, const char *time_setting)
+{
+	GError *error = NULL;
+	char *status = NULL;
+	ArvPtpMode mode = ARV_PTP_MODE_AUTO;
+	gint64 offset_ns = 0, deadline, max_offset_ns = (gint64) max_offset_ms * 1000000;
+	gboolean is_mode, custom_enable, expect_slave, expect_master;
+	gboolean tai = FALSE, status_ok, is_slave, clock_read, check_status, check_time, enable_done;
+
+	is_mode = gst_aravis_ptp_enable_mode (enable, &mode);
+	custom_enable = !is_mode && !gst_aravis_ptp_enable_is_no (enable);
+
+	if (is_mode && !gst_aravis_ptp_set_mode (gst_aravis, camera, mode))
+		return FALSE;
+	if (timeout_s == 0)
+		return TRUE;
+	if (is_mode && mode == ARV_PTP_MODE_OFF) {
+		GST_WARNING_OBJECT (gst_aravis, "ptp-wait with ptp-enable=off: nothing to wait for");
+		return TRUE;
+	}
+	/* "no": PTP left as it is; if it is off, there is nothing to wait for either */
+	if (!is_mode && !custom_enable && arv_camera_is_ptp_available (camera, NULL) &&
+	    arv_camera_get_ptp_mode (camera, &error) == ARV_PTP_MODE_OFF && error == NULL) {
+		GST_WARNING_OBJECT (gst_aravis, "ptp-wait: the camera's PTP is off (ptp-enable=no leaves it"
+				    " so), not waiting");
+		return TRUE;
+	}
+	g_clear_error (&error);
+	expect_slave = !is_mode || mode != ARV_PTP_MODE_MASTER;
+	expect_master = !is_mode || mode != ARV_PTP_MODE_SLAVE;
+
+	check_status = status_setting != NULL && status_setting[0] != '\0';
+	check_time = time_setting != NULL && time_setting[0] != '\0';
+	if (check_status && gst_aravis_ptp_is (status_setting, GST_ARAVIS_PTP_AUTO) &&
+	    !arv_camera_is_ptp_available (camera, NULL)) {
+		GST_WARNING_OBJECT (gst_aravis, "ptp-wait: no known PTP status feature, checking the clock only"
+				    " (set ptp-status)");
+		check_status = FALSE;
+	}
+	if (check_time && gst_aravis_ptp_is (time_setting, GST_ARAVIS_PTP_AUTO) &&
+	    !arv_camera_is_timestamp_latch_available (camera, NULL)) {
+		GST_WARNING_OBJECT (gst_aravis, "ptp-wait: no known timestamp latch, checking the status only"
+				    " (set ptp-time)");
+		check_time = FALSE;
+	}
+	if (!check_status && !check_time) {
+		GST_ELEMENT_ERROR (gst_aravis, RESOURCE, SETTINGS,
+				   (_("ptp-wait: nothing to wait for (no PTP status and no timestamp latch;"
+				      " set ptp-status or ptp-time)")), (NULL));
+		return FALSE;
+	}
+
+	/* an explicit ptp-enable is applied only when not synchronized at the first check, so that
+	 * one that toggles PTP does not disturb a synchronized camera */
+	enable_done = !custom_enable;
+	deadline = g_get_monotonic_time () + (gint64) timeout_s * G_USEC_PER_SEC;
+	for (;;) {
+		clock_read = FALSE;
+		is_slave = FALSE;
+		g_clear_pointer (&status, g_free);
+		status_ok = !check_status ||
+			gst_aravis_ptp_status_ok (camera, status_setting, expect_slave, expect_master,
+						  &status, &is_slave, &error);
+		/* the clock is compared when the camera follows a master: a custom or no status
+		 * check, or the auto status Slave; a master's clock is the reference */
+		if (status_ok && error == NULL && check_time &&
+		    (!check_status || !gst_aravis_ptp_is (status_setting, GST_ARAVIS_PTP_AUTO) || is_slave))
+			clock_read = gst_aravis_ptp_clock_offset (camera, time_setting, &offset_ns, &tai, &error);
+		if (error != NULL) {
+			GST_ELEMENT_ERROR (gst_aravis, RESOURCE, READ,
+					   (_("ptp-wait: %s"), error->message), (NULL));
+			g_error_free (error);
+			g_free (status);
+			return FALSE;
+		}
+		if (status_ok && (!clock_read || ABS (offset_ns) <= max_offset_ns))
+			break;
+		if (!enable_done) {
+			enable_done = TRUE;
+			GST_INFO_OBJECT (gst_aravis, "ptp-enable: \"%s\"", enable);
+			if (!arv_device_set_features_from_string (arv_camera_get_device (camera), enable, &error)) {
+				GST_ELEMENT_ERROR (gst_aravis, RESOURCE, SETTINGS,
+						   (_("ptp-enable \"%s\": %s"), enable,
+						    error != NULL ? error->message : "failed"), (NULL));
+				g_clear_error (&error);
+				g_free (status);
+				return FALSE;
+			}
+			continue;
+		}
+		if (g_get_monotonic_time () >= deadline) {
+			if (clock_read)
+				GST_ELEMENT_ERROR (gst_aravis, RESOURCE, SETTINGS,
+						   (_("ptp-wait: camera clock still %.3f s off the host's after %u s%s%s%s"),
+						    offset_ns / 1e9, timeout_s, status != NULL ? " (" : "",
+						    status != NULL ? status : "", status != NULL ? ")" : ""), (NULL));
+			else
+				GST_ELEMENT_ERROR (gst_aravis, RESOURCE, SETTINGS,
+						   (_("ptp-wait: camera PTP not %s after %u s (%s)"),
+						    expect_slave && expect_master ? "Slave or Master" :
+						    (expect_slave ? "Slave" : "Master"), timeout_s,
+						    status != NULL ? status : "status unreadable"), (NULL));
+			g_free (status);
+			return FALSE;
+		}
+		GST_DEBUG_OBJECT (gst_aravis, "ptp-wait: %s%s", status != NULL ? status : "",
+				  clock_read ? ", clock not yet synchronized" : "");
+		g_usleep (G_USEC_PER_SEC / 4);
+	}
+
+	if (clock_read)
+		GST_INFO_OBJECT (gst_aravis, "ptp-wait: %s, clock %+.3f ms from the host's %s",
+				 status != NULL ? status : "synchronized", offset_ns / 1e6, tai ? "TAI" : "UTC");
+	else
+		GST_INFO_OBJECT (gst_aravis, "ptp-wait: %s", status != NULL ? status : "synchronized");
+	g_free (status);
+	return TRUE;
+}
+
 static gboolean
 gst_aravis_start (GstBaseSrc *src)
 {
@@ -505,6 +840,9 @@ gst_aravis_start (GstBaseSrc *src)
 	gboolean result = TRUE;
 	gboolean notify = FALSE;
 	GstAravis* gst_aravis = GST_ARAVIS(src);
+	ArvCamera *camera;
+	guint ptp_wait_s, ptp_max_offset_ms;
+	char *ptp_enable, *ptp_status, *ptp_time;
 
         if (gst_aravis->camera_name != NULL)
                 GST_LOG_OBJECT (gst_aravis, "Open camera '%s'", gst_aravis->camera_name);
@@ -523,6 +861,23 @@ gst_aravis_start (GstBaseSrc *src)
 
 	if (error)
                 gst_aravis_init_error (gst_aravis, error);
+
+	GST_OBJECT_LOCK (gst_aravis);
+	ptp_wait_s = gst_aravis->ptp_wait_s;
+	ptp_max_offset_ms = gst_aravis->ptp_max_offset_ms;
+	ptp_enable = g_strdup (gst_aravis->ptp_enable);
+	ptp_status = g_strdup (gst_aravis->ptp_status);
+	ptp_time = g_strdup (gst_aravis->ptp_time);
+	camera = gst_aravis->camera != NULL ? g_object_ref (gst_aravis->camera) : NULL;
+	GST_OBJECT_UNLOCK (gst_aravis);
+
+	if (result && camera != NULL && (ptp_wait_s > 0 || !gst_aravis_ptp_enable_is_no (ptp_enable)))
+		result = gst_aravis_ptp_start (gst_aravis, camera, ptp_wait_s, ptp_max_offset_ms,
+					       ptp_enable, ptp_status, ptp_time);
+	g_clear_object (&camera);
+	g_free (ptp_enable);
+	g_free (ptp_status);
+	g_free (ptp_time);
 
 	return result;
 }
@@ -756,6 +1111,11 @@ gst_aravis_init (GstAravis *gst_aravis)
 
 	gst_aravis->trigger_source = NULL;
 	gst_aravis->add_reference_timestamp_meta = FALSE;
+	gst_aravis->ptp_wait_s = 0;
+	gst_aravis->ptp_max_offset_ms = GST_ARAVIS_DEFAULT_PTP_MAX_OFFSET_MS;
+	gst_aravis->ptp_enable = g_strdup (GST_ARAVIS_PTP_NO);
+	gst_aravis->ptp_status = g_strdup (GST_ARAVIS_PTP_AUTO);
+	gst_aravis->ptp_time = g_strdup (GST_ARAVIS_PTP_AUTO);
 
 	gst_aravis->camera = NULL;
 	gst_aravis->stream = NULL;
@@ -777,6 +1137,9 @@ gst_aravis_finalize (GObject * object)
 	all_caps = g_steal_pointer (&gst_aravis->all_caps);
 	g_clear_pointer (&gst_aravis->camera_name, g_free);
 	g_clear_pointer (&gst_aravis->features, g_free);
+	g_clear_pointer (&gst_aravis->ptp_enable, g_free);
+	g_clear_pointer (&gst_aravis->ptp_status, g_free);
+	g_clear_pointer (&gst_aravis->ptp_time, g_free);
         g_clear_pointer (&gst_aravis->trigger_source, g_free);
 	GST_OBJECT_UNLOCK (gst_aravis);
 
@@ -915,6 +1278,34 @@ gst_aravis_set_property (GObject * object, guint prop_id,
                         gst_aravis->add_reference_timestamp_meta = g_value_get_boolean (value);
                         GST_OBJECT_UNLOCK (gst_aravis);
                         break;
+                case PROP_PTP_WAIT:
+                        GST_OBJECT_LOCK (gst_aravis);
+                        gst_aravis->ptp_wait_s = g_value_get_uint (value);
+                        GST_OBJECT_UNLOCK (gst_aravis);
+                        break;
+                case PROP_PTP_MAX_OFFSET:
+                        GST_OBJECT_LOCK (gst_aravis);
+                        gst_aravis->ptp_max_offset_ms = g_value_get_uint (value);
+                        GST_OBJECT_UNLOCK (gst_aravis);
+                        break;
+                case PROP_PTP_ENABLE:
+                        GST_OBJECT_LOCK (gst_aravis);
+                        g_free (gst_aravis->ptp_enable);
+                        gst_aravis->ptp_enable = g_value_dup_string (value);
+                        GST_OBJECT_UNLOCK (gst_aravis);
+                        break;
+                case PROP_PTP_STATUS:
+                        GST_OBJECT_LOCK (gst_aravis);
+                        g_free (gst_aravis->ptp_status);
+                        gst_aravis->ptp_status = g_value_dup_string (value);
+                        GST_OBJECT_UNLOCK (gst_aravis);
+                        break;
+                case PROP_PTP_TIME:
+                        GST_OBJECT_LOCK (gst_aravis);
+                        g_free (gst_aravis->ptp_time);
+                        gst_aravis->ptp_time = g_value_dup_string (value);
+                        GST_OBJECT_UNLOCK (gst_aravis);
+                        break;
                 default:
                         G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
                         break;
@@ -1031,6 +1422,31 @@ gst_aravis_get_property (GObject * object, guint prop_id, GValue * value,
 		case PROP_ADD_REFERENCE_TIMESTAMP_META:
 			GST_OBJECT_LOCK (gst_aravis);
 			g_value_set_boolean (value, gst_aravis->add_reference_timestamp_meta);
+			GST_OBJECT_UNLOCK (gst_aravis);
+			break;
+		case PROP_PTP_WAIT:
+			GST_OBJECT_LOCK (gst_aravis);
+			g_value_set_uint (value, gst_aravis->ptp_wait_s);
+			GST_OBJECT_UNLOCK (gst_aravis);
+			break;
+		case PROP_PTP_MAX_OFFSET:
+			GST_OBJECT_LOCK (gst_aravis);
+			g_value_set_uint (value, gst_aravis->ptp_max_offset_ms);
+			GST_OBJECT_UNLOCK (gst_aravis);
+			break;
+		case PROP_PTP_ENABLE:
+			GST_OBJECT_LOCK (gst_aravis);
+			g_value_set_string (value, gst_aravis->ptp_enable);
+			GST_OBJECT_UNLOCK (gst_aravis);
+			break;
+		case PROP_PTP_STATUS:
+			GST_OBJECT_LOCK (gst_aravis);
+			g_value_set_string (value, gst_aravis->ptp_status);
+			GST_OBJECT_UNLOCK (gst_aravis);
+			break;
+		case PROP_PTP_TIME:
+			GST_OBJECT_LOCK (gst_aravis);
+			g_value_set_string (value, gst_aravis->ptp_time);
 			GST_OBJECT_UNLOCK (gst_aravis);
 			break;
 		default:
@@ -1236,6 +1652,51 @@ gst_aravis_class_init (GstAravisClass * klass)
                                      " absolute time if the device clock is PTP-synchronized",
                                      FALSE,
                                      G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS);
+	properties[PROP_PTP_WAIT] =
+		g_param_spec_uint ("ptp-wait",
+				   "PTP wait",
+				   "Seconds to wait at start until the camera's PTP is synchronized: its status"
+				   " (ptp-status) and its clock within ptp-max-offset of the host's, UTC or TAI"
+				   " (ptp-time); the start fails otherwise. 0: no wait",
+				   0, G_MAXUINT, 0,
+				   G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS);
+	properties[PROP_PTP_MAX_OFFSET] =
+		g_param_spec_uint ("ptp-max-offset",
+				   "PTP maximum clock offset",
+				   "ptp-wait: largest accepted offset of the camera's clock from the host's,"
+				   " in ms (measured through a timestamp latch, so not below its latency)",
+				   1, G_MAXUINT, GST_ARAVIS_DEFAULT_PTP_MAX_OFFSET_MS,
+				   G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS);
+	properties[PROP_PTP_ENABLE] =
+		g_param_spec_string ("ptp-enable",
+				     "PTP mode",
+				     "The camera's PTP mode, set at start: \"no\" (leave it as it is; if it is"
+				     " off, ptp-wait does not wait), \"off\","
+				     " \"auto\" (master or slave by the best master clock algorithm), \"slave\""
+				     " (slave only), \"master\" (master only); the start fails if the camera can't."
+				     " Or feature assignments and commands as in features, for cameras with other"
+				     " names, e.g. \"GevIEEE1588Mode=SlaveOnly GevIEEE1588=true\", applied when"
+				     " ptp-wait finds the camera not synchronized",
+				     GST_ARAVIS_PTP_NO,
+				     G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS);
+	properties[PROP_PTP_STATUS] =
+		g_param_spec_string ("ptp-status",
+				     "PTP status condition",
+				     "ptp-wait: the synchronized condition. \"auto\": the PTP status is Slave,"
+				     " Master, or either, after ptp-enable; \"\": no status check (clock only); else"
+				     " commands (latches) and one Feature=Value condition, e.g."
+				     " \"PtpDataSetLatch PtpStatus=Slave\" (case-insensitive)",
+				     GST_ARAVIS_PTP_AUTO,
+				     G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS);
+	properties[PROP_PTP_TIME] =
+		g_param_spec_string ("ptp-time",
+				     "PTP time readout",
+				     "ptp-wait: how to read the camera's clock for the comparison with the host's"
+				     " (not for a PTP master). \"auto\": the known timestamp latch; \"\": no clock"
+				     " check (status only); else commands (latches) and the integer feature with"
+				     " the time in ns, e.g. \"TimestampLatch TimestampLatchValue\"",
+				     GST_ARAVIS_PTP_AUTO,
+				     G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS);
 
 	g_object_class_install_properties (gobject_class,
 					   G_N_ELEMENTS (properties),
