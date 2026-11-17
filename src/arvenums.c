@@ -56,6 +56,43 @@ arv_auto_from_string (const char *string)
 			     G_N_ELEMENTS (arv_auto_strings));
 }
 
+static const char *arv_ptp_mode_strings[] = {
+	"Off",
+	"Auto",
+	"Slave",
+	"Master"
+};
+
+/**
+ * arv_ptp_mode_to_string:
+ * @value: a #ArvPtpMode
+ *
+ * Returns: "Off", "Auto", "Slave" or "Master".
+ *
+ * Since: 0.10.0
+ */
+
+const char *
+arv_ptp_mode_to_string (ArvPtpMode value)
+{
+	return arv_ptp_mode_strings[CLAMP (value, 0, ARV_PTP_MODE_MASTER)];
+}
+
+/**
+ * arv_ptp_mode_from_string:
+ * @string: "Off", "Auto", "Slave" or "Master"
+ *
+ * Returns: the #ArvPtpMode, %ARV_PTP_MODE_OFF for an unknown string.
+ *
+ * Since: 0.10.0
+ */
+
+ArvPtpMode
+arv_ptp_mode_from_string (const char *string)
+{
+	return _from_string (string, arv_ptp_mode_strings, G_N_ELEMENTS (arv_ptp_mode_strings));
+}
+
 static const char *arv_acquisition_mode_strings[] = {
 	"Continuous",
 	"SingleFrame",

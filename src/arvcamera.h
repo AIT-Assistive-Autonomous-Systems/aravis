@@ -276,6 +276,16 @@ ARV_API void            arv_camera_uv_set_maximum_transfer_size         (ArvCame
 
 ARV_API gboolean	arv_camera_is_gentl_device			(ArvCamera *camera);
 
+/* PTP */
+
+ARV_API gboolean	arv_camera_is_ptp_available			(ArvCamera *camera, GError **error);
+ARV_API gboolean	arv_camera_is_ptp_mode_available		(ArvCamera *camera, ArvPtpMode mode, GError **error);
+ARV_API void		arv_camera_set_ptp_mode				(ArvCamera *camera, ArvPtpMode mode, GError **error);
+ARV_API ArvPtpMode	arv_camera_get_ptp_mode				(ArvCamera *camera, GError **error);
+ARV_API const char *	arv_camera_get_ptp_status			(ArvCamera *camera, GError **error);
+ARV_API gboolean	arv_camera_is_timestamp_latch_available		(ArvCamera *camera, GError **error);
+ARV_API guint64		arv_camera_get_latched_timestamp		(ArvCamera *camera, GError **error);
+
 /* Chunk data */
 
 ARV_API gboolean		arv_camera_are_chunks_available		(ArvCamera *camera, GError **error);

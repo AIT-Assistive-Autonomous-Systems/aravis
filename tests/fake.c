@@ -601,6 +601,39 @@ set_flag (gpointer user_data, GObject *object)
 }
 
 static void
+camera_ptp_test (void)
+{
+	ArvCamera *camera;
+	GError *error = NULL;
+
+	camera = arv_camera_new ("Fake_1", &error);
+	g_assert (ARV_IS_CAMERA (camera));
+	g_assert (error == NULL);
+
+	/* the fake camera has no PTP features */
+	g_assert (!arv_camera_is_ptp_available (camera, NULL));
+	g_assert (!arv_camera_is_ptp_mode_available (camera, ARV_PTP_MODE_SLAVE, NULL));
+	g_assert_cmpstr (arv_ptp_mode_to_string (ARV_PTP_MODE_MASTER), ==, "Master");
+	g_assert_cmpint (arv_ptp_mode_from_string ("Slave"), ==, ARV_PTP_MODE_SLAVE);
+
+	arv_camera_set_ptp_mode (camera, ARV_PTP_MODE_SLAVE, &error);
+	g_assert_error (error, ARV_DEVICE_ERROR, ARV_DEVICE_ERROR_FEATURE_NOT_FOUND);
+	g_clear_error (&error);
+
+	g_assert (arv_camera_get_ptp_status (camera, &error) == NULL);
+	g_assert_error (error, ARV_DEVICE_ERROR, ARV_DEVICE_ERROR_FEATURE_NOT_FOUND);
+	g_clear_error (&error);
+
+	if (!arv_camera_is_timestamp_latch_available (camera, NULL)) {
+		g_assert (arv_camera_get_latched_timestamp (camera, &error) == 0);
+		g_assert_error (error, ARV_DEVICE_ERROR, ARV_DEVICE_ERROR_FEATURE_NOT_FOUND);
+		g_clear_error (&error);
+	}
+
+	g_object_unref (camera);
+}
+
+static void
 camera_device_test (void)
 {
 	ArvDevice *device;
@@ -831,6 +864,7 @@ main (int argc, char *argv[])
 	g_test_add_func ("/fake/fake-device-error", fake_device_error_test);
 	g_test_add_func ("/fake/fake-stream", fake_stream_test);
 	g_test_add_func ("/fake/camera-api", camera_api_test);
+	g_test_add_func ("/fake/camera-ptp", camera_ptp_test);
 	g_test_add_func ("/fake/camera-device", camera_device_test);
 	g_test_add_func ("/fake/camera-trigger-selector", camera_trigger_selector_test);
 	g_test_add_func ("/fake/set-features-from-string", set_features_from_string_test);

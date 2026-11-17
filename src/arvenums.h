@@ -49,6 +49,26 @@ ARV_API const char *		arv_auto_to_string		(ArvAuto value);
 ARV_API ArvAuto 		arv_auto_from_string		(const char *string);
 
 /**
+ * ArvPtpMode:
+ * @ARV_PTP_MODE_OFF: PTP disabled
+ * @ARV_PTP_MODE_AUTO: PTP enabled, master or slave by the best master clock algorithm
+ * @ARV_PTP_MODE_SLAVE: PTP enabled, slave only
+ * @ARV_PTP_MODE_MASTER: PTP enabled, master only
+ *
+ * Since: 0.10.0
+ */
+
+typedef enum {
+	ARV_PTP_MODE_OFF,
+	ARV_PTP_MODE_AUTO,
+	ARV_PTP_MODE_SLAVE,
+	ARV_PTP_MODE_MASTER
+} ArvPtpMode;
+
+ARV_API const char *		arv_ptp_mode_to_string		(ArvPtpMode value);
+ARV_API ArvPtpMode		arv_ptp_mode_from_string	(const char *string);
+
+/**
  * ArvAcquisitionMode:
  * @ARV_ACQUISITION_MODE_CONTINUOUS: frames are captured continuously until stopped with the AcquisitionStop command.
  * @ARV_ACQUISITION_MODE_SINGLE_FRAME: only one frame will be acquired

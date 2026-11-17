@@ -31,6 +31,7 @@
 
 #include <arvfeatures.h>
 #include <arvdebug.h>
+#include <arvdebugprivate.h>
 #include <arvcamera.h>
 #include <arvsystem.h>
 #include <arvgvinterface.h>
@@ -99,6 +100,14 @@ typedef enum {
 	ARV_CAMERA_SERIES_IMPERX_OTHER
 } ArvCameraSeries;
 
+/* PTP feature sets */
+typedef enum {
+	ARV_CAMERA_PTP_NONE,
+	ARV_CAMERA_PTP_SFNC,		/* PtpEnable, PtpSlaveOnly, PtpStatus, PtpDataSetLatch */
+	ARV_CAMERA_PTP_MODE,		/* PtpMode (Off, Slave, Auto, ...), PtpStatus (Allied Vision) */
+	ARV_CAMERA_PTP_GEV		/* GevIEEE1588, GevIEEE1588Mode, GevIEEE1588Status[Latched] */
+} ArvCameraPtp;
+
 typedef struct {
 	char *name;
 	ArvDevice *device;
@@ -123,6 +132,17 @@ typedef struct {
 	gboolean has_acquisition_frame_rate_enabled;
 
         gboolean has_region_offset;
+
+	ArvCameraPtp ptp;
+	const char *ptp_preset;			/* name of the detected PTP feature set, for logs */
+	const char *ptp_enable;			/* boolean, or the PtpMode enumeration */
+	const char *ptp_role;			/* PtpSlaveOnly boolean, GevIEEE1588Mode enumeration, or NULL */
+	const char *ptp_status;
+	const char *ptp_status_latch;		/* command executed before reading ptp_status, or NULL */
+
+	const char *timestamp_latch;
+	const char *timestamp_value;
+	const char *timestamp_tick_frequency;	/* GigE Vision ticks, or NULL for ns */
 
 	GError *init_error;
 } ArvCameraPrivate;
@@ -4027,6 +4047,314 @@ arv_camera_is_gentl_device	(ArvCamera *camera)
 	return ARV_IS_GENTL_DEVICE (priv->device);
 }
 
+/* PTP */
+
+static gboolean
+_check_ptp (ArvCameraPrivate *priv, GError **error)
+{
+	if (priv->ptp != ARV_CAMERA_PTP_NONE)
+		return TRUE;
+	g_set_error (error, ARV_DEVICE_ERROR, ARV_DEVICE_ERROR_FEATURE_NOT_FOUND,
+		     "No known PTP feature set (PtpEnable, PtpMode or GevIEEE1588 with a status)");
+	return FALSE;
+}
+
+/**
+ * arv_camera_is_ptp_available:
+ * @camera: a #ArvCamera
+ * @error: a #GError placeholder, %NULL to ignore
+ *
+ * Whether the device has one of the known sets of PTP (IEEE 1588) features: SFNC (PtpEnable,
+ * PtpStatus), Allied Vision PtpMode / PtpStatus, or GigE Vision 2.0 (GevIEEE1588,
+ * GevIEEE1588Status[Latched]). The sets and their references are listed in [PTP](ptp.html).
+ *
+ * Returns: %TRUE if PTP can be controlled with the arv_camera_*_ptp_* functions.
+ *
+ * Since: 0.10.0
+ */
+
+gboolean
+arv_camera_is_ptp_available (ArvCamera *camera, GError **error)
+{
+	ArvCameraPrivate *priv = arv_camera_get_instance_private (camera);
+
+	g_return_val_if_fail (ARV_IS_CAMERA (camera), FALSE);
+
+	return priv->ptp != ARV_CAMERA_PTP_NONE;
+}
+
+/* GevIEEE1588Mode entries (GigE Vision 2.0 names Auto and SlaveOnly) */
+static const char *
+_gev_ptp_role (ArvPtpMode mode)
+{
+	switch (mode) {
+		case ARV_PTP_MODE_SLAVE:
+			return "SlaveOnly";
+		case ARV_PTP_MODE_MASTER:
+			return "MasterOnly";
+		default:
+			return "Auto";
+	}
+}
+
+/* PtpMode entries */
+static const char *
+_ptp_mode_entry (ArvPtpMode mode)
+{
+	return arv_ptp_mode_to_string (mode);
+}
+
+/**
+ * arv_camera_is_ptp_mode_available:
+ * @camera: a #ArvCamera
+ * @mode: a #ArvPtpMode
+ * @error: a #GError placeholder, %NULL to ignore
+ *
+ * Whether arv_camera_set_ptp_mode() can set @mode on this device. %ARV_PTP_MODE_OFF and
+ * %ARV_PTP_MODE_AUTO are available with any known PTP feature set; slave only needs PtpSlaveOnly,
+ * GevIEEE1588Mode=SlaveOnly or PtpMode=Slave, master only GevIEEE1588Mode=MasterOnly or
+ * PtpMode=Master.
+ *
+ * Returns: %TRUE if @mode can be set.
+ *
+ * Since: 0.10.0
+ */
+
+gboolean
+arv_camera_is_ptp_mode_available (ArvCamera *camera, ArvPtpMode mode, GError **error)
+{
+	ArvCameraPrivate *priv = arv_camera_get_instance_private (camera);
+
+	g_return_val_if_fail (ARV_IS_CAMERA (camera), FALSE);
+
+	switch (priv->ptp) {
+		case ARV_CAMERA_PTP_NONE:
+			return FALSE;
+		case ARV_CAMERA_PTP_MODE:
+			return arv_device_is_enumeration_entry_available (priv->device, priv->ptp_enable,
+									  _ptp_mode_entry (mode), error);
+		case ARV_CAMERA_PTP_SFNC:
+			return mode == ARV_PTP_MODE_OFF || mode == ARV_PTP_MODE_AUTO ||
+				(mode == ARV_PTP_MODE_SLAVE && priv->ptp_role != NULL);
+		case ARV_CAMERA_PTP_GEV:
+			if (mode == ARV_PTP_MODE_OFF)
+				return TRUE;
+			if (priv->ptp_role == NULL)
+				return mode == ARV_PTP_MODE_AUTO;
+			return arv_device_is_enumeration_entry_available (priv->device, priv->ptp_role,
+									  _gev_ptp_role (mode), error);
+	}
+	return FALSE;
+}
+
+/**
+ * arv_camera_set_ptp_mode:
+ * @camera: a #ArvCamera
+ * @mode: a #ArvPtpMode
+ * @error: a #GError placeholder, %NULL to ignore
+ *
+ * Sets the device's PTP (IEEE 1588) mode: off, or enabled as master or slave by the best master clock
+ * algorithm, slave only or master only (see arv_camera_is_ptp_mode_available()). Nothing is written
+ * if the device is already in @mode. Devices often accept a role change only while PTP is disabled:
+ * an enabled PTP is disabled for the change and enabled again.
+ *
+ * Since: 0.10.0
+ */
+
+void
+arv_camera_set_ptp_mode (ArvCamera *camera, ArvPtpMode mode, GError **error)
+{
+	ArvCameraPrivate *priv = arv_camera_get_instance_private (camera);
+	GError *local_error = NULL;
+	ArvPtpMode current;
+
+	g_return_if_fail (ARV_IS_CAMERA (camera));
+
+	if (!_check_ptp (priv, error))
+		return;
+
+	current = arv_camera_get_ptp_mode (camera, &local_error);
+	if (local_error == NULL && current == mode)
+		return;
+	if (local_error == NULL && !arv_camera_is_ptp_mode_available (camera, mode, &local_error) &&
+	    local_error == NULL)
+		g_set_error (&local_error, ARV_DEVICE_ERROR, ARV_DEVICE_ERROR_FEATURE_NOT_FOUND,
+			     "PTP mode %s not available", arv_ptp_mode_to_string (mode));
+	if (local_error != NULL) {
+		g_propagate_error (error, local_error);
+		return;
+	}
+
+	if (priv->ptp == ARV_CAMERA_PTP_MODE) {
+		arv_camera_set_string (camera, priv->ptp_enable, _ptp_mode_entry (mode), error);
+		return;
+	}
+
+	if (current != ARV_PTP_MODE_OFF)
+		arv_camera_set_boolean (camera, priv->ptp_enable, FALSE, &local_error);
+	if (local_error == NULL && mode != ARV_PTP_MODE_OFF && priv->ptp_role != NULL) {
+		if (priv->ptp == ARV_CAMERA_PTP_GEV)
+			arv_camera_set_string (camera, priv->ptp_role, _gev_ptp_role (mode), &local_error);
+		else
+			arv_camera_set_boolean (camera, priv->ptp_role, mode == ARV_PTP_MODE_SLAVE, &local_error);
+	}
+	if (local_error == NULL && mode != ARV_PTP_MODE_OFF)
+		arv_camera_set_boolean (camera, priv->ptp_enable, TRUE, &local_error);
+	if (local_error != NULL)
+		g_propagate_error (error, local_error);
+}
+
+/**
+ * arv_camera_get_ptp_mode:
+ * @camera: a #ArvCamera
+ * @error: a #GError placeholder, %NULL to ignore
+ *
+ * Returns: the device's PTP mode, %ARV_PTP_MODE_OFF on error.
+ *
+ * Since: 0.10.0
+ */
+
+ArvPtpMode
+arv_camera_get_ptp_mode (ArvCamera *camera, GError **error)
+{
+	ArvCameraPrivate *priv = arv_camera_get_instance_private (camera);
+	GError *local_error = NULL;
+	const char *role;
+	gboolean enabled;
+
+	g_return_val_if_fail (ARV_IS_CAMERA (camera), ARV_PTP_MODE_OFF);
+
+	if (!_check_ptp (priv, error))
+		return ARV_PTP_MODE_OFF;
+
+	if (priv->ptp == ARV_CAMERA_PTP_MODE) {
+		role = arv_camera_get_string (camera, priv->ptp_enable, error);
+		return role != NULL ? arv_ptp_mode_from_string (role) : ARV_PTP_MODE_OFF;
+	}
+
+	enabled = arv_camera_get_boolean (camera, priv->ptp_enable, &local_error);
+	if (local_error != NULL) {
+		g_propagate_error (error, local_error);
+		return ARV_PTP_MODE_OFF;
+	}
+	if (!enabled)
+		return ARV_PTP_MODE_OFF;
+	if (priv->ptp_role == NULL)
+		return ARV_PTP_MODE_AUTO;
+
+	if (priv->ptp == ARV_CAMERA_PTP_SFNC)
+		return arv_camera_get_boolean (camera, priv->ptp_role, error) ?
+			ARV_PTP_MODE_SLAVE : ARV_PTP_MODE_AUTO;
+
+	role = arv_camera_get_string (camera, priv->ptp_role, error);
+	if (g_strcmp0 (role, "SlaveOnly") == 0)
+		return ARV_PTP_MODE_SLAVE;
+	if (g_strcmp0 (role, "MasterOnly") == 0)
+		return ARV_PTP_MODE_MASTER;
+	return ARV_PTP_MODE_AUTO;
+}
+
+/**
+ * arv_camera_get_ptp_status:
+ * @camera: a #ArvCamera
+ * @error: a #GError placeholder, %NULL to ignore
+ *
+ * Reads the device's PTP port state, latching the PTP data set first where the device requires it.
+ * The values are the device's: usually "Slave" once synchronized to a master, and "Initializing",
+ * "Listening", "Uncalibrated", "Master", "Disabled", "Faulty" ...
+ *
+ * Returns: the PTP status, or %NULL on error.
+ *
+ * Since: 0.10.0
+ */
+
+const char *
+arv_camera_get_ptp_status (ArvCamera *camera, GError **error)
+{
+	ArvCameraPrivate *priv = arv_camera_get_instance_private (camera);
+	GError *local_error = NULL;
+
+	g_return_val_if_fail (ARV_IS_CAMERA (camera), NULL);
+
+	if (!_check_ptp (priv, error))
+		return NULL;
+
+	if (priv->ptp_status_latch != NULL)
+		arv_camera_execute_command (camera, priv->ptp_status_latch, &local_error);
+	if (local_error != NULL) {
+		g_propagate_error (error, local_error);
+		return NULL;
+	}
+
+	return arv_camera_get_string (camera, priv->ptp_status, error);
+}
+
+/**
+ * arv_camera_is_timestamp_latch_available:
+ * @camera: a #ArvCamera
+ * @error: a #GError placeholder, %NULL to ignore
+ *
+ * Returns: %TRUE if the device time can be read with arv_camera_get_latched_timestamp() (SFNC
+ * TimestampLatch / TimestampLatchValue, or GigE Vision GevTimestampControlLatch / GevTimestampValue).
+ *
+ * Since: 0.10.0
+ */
+
+gboolean
+arv_camera_is_timestamp_latch_available (ArvCamera *camera, GError **error)
+{
+	ArvCameraPrivate *priv = arv_camera_get_instance_private (camera);
+
+	g_return_val_if_fail (ARV_IS_CAMERA (camera), FALSE);
+
+	return priv->timestamp_latch != NULL;
+}
+
+/**
+ * arv_camera_get_latched_timestamp:
+ * @camera: a #ArvCamera
+ * @error: a #GError placeholder, %NULL to ignore
+ *
+ * Latches the device's timestamp counter and reads it, in the time base of the buffer timestamps.
+ * With PTP synchronized, this is the PTP time. GigE Vision tick counts are converted with
+ * GevTimestampTickFrequency.
+ *
+ * Returns: the device time in ns, 0 on error.
+ *
+ * Since: 0.10.0
+ */
+
+guint64
+arv_camera_get_latched_timestamp (ArvCamera *camera, GError **error)
+{
+	ArvCameraPrivate *priv = arv_camera_get_instance_private (camera);
+	GError *local_error = NULL;
+	gint64 value, frequency = 0;
+
+	g_return_val_if_fail (ARV_IS_CAMERA (camera), 0);
+
+	if (priv->timestamp_latch == NULL) {
+		g_set_error (error, ARV_DEVICE_ERROR, ARV_DEVICE_ERROR_FEATURE_NOT_FOUND,
+			     "No timestamp latch (TimestampLatch, GevTimestampControlLatch)");
+		return 0;
+	}
+
+	arv_camera_execute_command (camera, priv->timestamp_latch, &local_error);
+	if (local_error == NULL)
+		value = arv_camera_get_integer (camera, priv->timestamp_value, &local_error);
+	if (local_error == NULL && priv->timestamp_tick_frequency != NULL)
+		frequency = arv_camera_get_integer (camera, priv->timestamp_tick_frequency, &local_error);
+	if (local_error != NULL) {
+		g_propagate_error (error, local_error);
+		return 0;
+	}
+
+	if (frequency > 0 && frequency != 1000000000)
+		return (guint64) value / frequency * 1000000000 +
+			(guint64) value % frequency * 1000000000 / frequency;
+	return value;
+}
+
 /**
  * arv_camera_are_chunks_available:
  * @camera: a #ArvCamera
@@ -4343,6 +4671,123 @@ arv_camera_finalize (GObject *object)
 	G_OBJECT_CLASS (arv_camera_parent_class)->finalize (object);
 }
 
+/* PTP presets: the known PTP feature sets, tried in this order. The names identify them in the
+ * logs only. References (see also docs/reference/aravis/ptp.md):
+ *   SFNC: GenICam SFNC "PTP Control" (PtpEnable, PtpStatus, PtpDataSetLatch); PtpSlaveOnly is
+ *     vendor-defined (IDS); Lucid, IDS, Basler ace 2 / dart M
+ *   Allied Vision: PtpMode Off/Slave/Master/Auto with PtpStatus (application note "PTP IEEE 1588
+ *     with Prosilica GT, GC, Manta"); not Emergent's PtpMode (Off/OneStep/TwoStep), excluded by
+ *     its entries
+ *   GigE Vision 2.0: GevIEEE1588 with GevIEEE1588Mode (Auto/SlaveOnly on Teledyne FLIR Forge) and
+ *     GevIEEE1588Status, or GevIEEE1588StatusLatched after GevIEEE1588DataSetLatch, which Basler
+ *     recommends where available */
+
+typedef struct {
+	const char *name;
+	ArvCameraPtp ptp;
+	const char *enable;		/* boolean, or the PtpMode enumeration */
+	const char *role;		/* optional: PtpSlaveOnly boolean or GevIEEE1588Mode enumeration */
+	const char *status;
+	const char *status_latch;	/* optional, required if status_latch_required */
+	gboolean status_latch_required;
+} ArvCameraPtpPreset;
+
+static const ArvCameraPtpPreset arv_camera_ptp_presets[] = {
+	{"SFNC", ARV_CAMERA_PTP_SFNC, "PtpEnable", "PtpSlaveOnly", "PtpStatus", "PtpDataSetLatch", FALSE},
+	{"Allied Vision PtpMode", ARV_CAMERA_PTP_MODE, "PtpMode", NULL, "PtpStatus", "PtpDataSetLatch", FALSE},
+	{"GigE Vision 2.0, latched status", ARV_CAMERA_PTP_GEV, "GevIEEE1588", "GevIEEE1588Mode",
+		"GevIEEE1588StatusLatched", "GevIEEE1588DataSetLatch", TRUE},
+	{"GigE Vision 2.0", ARV_CAMERA_PTP_GEV, "GevIEEE1588", "GevIEEE1588Mode", "GevIEEE1588Status",
+		"GevIEEE1588DataSetLatch", FALSE}
+};
+
+static gboolean
+_has_boolean (ArvDevice *device, const char *feature)
+{
+	return ARV_IS_GC_BOOLEAN (arv_device_get_feature (device, feature));
+}
+
+static gboolean
+_has_string (ArvDevice *device, const char *feature)
+{
+	return ARV_IS_GC_STRING (arv_device_get_feature (device, feature));
+}
+
+static gboolean
+_has_command (ArvDevice *device, const char *feature)
+{
+	return ARV_IS_GC_COMMAND (arv_device_get_feature (device, feature));
+}
+
+static gboolean
+_has_integer (ArvDevice *device, const char *feature)
+{
+	return ARV_IS_GC_INTEGER (arv_device_get_feature (device, feature));
+}
+
+static gboolean
+_ptp_preset_matches (ArvDevice *device, const ArvCameraPtpPreset *preset)
+{
+	if (!_has_string (device, preset->status))
+		return FALSE;
+	if (preset->status_latch_required && !_has_command (device, preset->status_latch))
+		return FALSE;
+	if (preset->ptp == ARV_CAMERA_PTP_MODE)
+		/* PtpMode as the role, not Emergent's Off/OneStep/TwoStep */
+		return _has_string (device, preset->enable) &&
+			(arv_device_is_enumeration_entry_available (device, preset->enable, "Slave", NULL) ||
+			 arv_device_is_enumeration_entry_available (device, preset->enable, "Master", NULL));
+	return _has_boolean (device, preset->enable);
+}
+
+static void
+arv_camera_detect_ptp (ArvCameraPrivate *priv)
+{
+	ArvDevice *device = priv->device;
+	const ArvCameraPtpPreset *preset = NULL;
+	guint i;
+
+	priv->ptp = ARV_CAMERA_PTP_NONE;
+	priv->ptp_preset = priv->ptp_enable = priv->ptp_role = priv->ptp_status = priv->ptp_status_latch = NULL;
+
+	for (i = 0; i < G_N_ELEMENTS (arv_camera_ptp_presets) && preset == NULL; i++)
+		if (_ptp_preset_matches (device, &arv_camera_ptp_presets[i]))
+			preset = &arv_camera_ptp_presets[i];
+
+	if (preset != NULL) {
+		priv->ptp = preset->ptp;
+		priv->ptp_preset = preset->name;
+		priv->ptp_enable = preset->enable;
+		if (preset->role != NULL &&
+		    (preset->ptp == ARV_CAMERA_PTP_GEV ? _has_string (device, preset->role) :
+		     _has_boolean (device, preset->role)))
+			priv->ptp_role = preset->role;
+		priv->ptp_status = preset->status;
+		if (preset->status_latch != NULL && _has_command (device, preset->status_latch))
+			priv->ptp_status_latch = preset->status_latch;
+		arv_info_device ("[Camera::detect_ptp] PTP preset '%s': %s%s%s, status %s%s%s",
+				 preset->name, priv->ptp_enable,
+				 priv->ptp_role != NULL ? ", role " : "", priv->ptp_role != NULL ? priv->ptp_role : "",
+				 priv->ptp_status, priv->ptp_status_latch != NULL ? " after " : "",
+				 priv->ptp_status_latch != NULL ? priv->ptp_status_latch : "");
+	} else
+		arv_info_device ("[Camera::detect_ptp] No known PTP feature set");
+
+	/* timestamp latch: SFNC TimestampLatch / TimestampLatchValue (ns), GigE Vision
+	 * GevTimestampControlLatch / GevTimestampValue (ticks of GevTimestampTickFrequency) */
+	priv->timestamp_latch = priv->timestamp_value = priv->timestamp_tick_frequency = NULL;
+	if (_has_command (device, "TimestampLatch") && _has_integer (device, "TimestampLatchValue")) {
+		priv->timestamp_latch = "TimestampLatch";
+		priv->timestamp_value = "TimestampLatchValue";
+	} else if (_has_command (device, "GevTimestampControlLatch") &&
+		   _has_integer (device, "GevTimestampValue")) {
+		priv->timestamp_latch = "GevTimestampControlLatch";
+		priv->timestamp_value = "GevTimestampValue";
+		priv->timestamp_tick_frequency = _has_integer (device, "GevTimestampTickFrequency") ?
+			"GevTimestampTickFrequency" : NULL;
+	}
+}
+
 static void
 arv_camera_constructed (GObject *object)
 {
@@ -4445,6 +4890,8 @@ arv_camera_constructed (GObject *object)
 
         priv->has_region_offset = ARV_IS_GC_INTEGER(arv_device_get_feature(priv->device, "OffsetX")) &&
                 ARV_IS_GC_INTEGER(arv_device_get_feature(priv->device, "OffsetY"));
+
+	arv_camera_detect_ptp (priv);
 }
 
 static void
