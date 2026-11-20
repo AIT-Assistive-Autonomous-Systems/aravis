@@ -760,6 +760,22 @@ gst_aravis_create (GstPushSrc * push_src, GstBuffer ** buffer)
 
 	if (arv_buffer == NULL)
 		goto error;
+
+	/* How long the frame waited in the stream's output queue (received
+	 * completely -> popped here) and how many completed frames still wait:
+	 * a backlog there is delivered one per frame period and never shrinks
+	 * while downstream keeps pace only. */
+	if (gst_debug_category_get_threshold (GST_CAT_DEFAULT) >= GST_LEVEL_DEBUG) {
+		gint n_input = 0, n_output = 0, n_filling = 0;
+		guint64 received_ns = arv_buffer_get_system_timestamp (arv_buffer);
+		gint64 now_ns = g_get_real_time () * 1000;
+
+		arv_stream_get_n_owned_buffers (gst_aravis->stream, &n_input, &n_output, &n_filling);
+		GST_DEBUG_OBJECT (gst_aravis, "frame %" G_GUINT64_FORMAT ": waited %.3f ms in the output queue, "
+				  "%d more waiting, %d filling, %d free",
+				  arv_buffer_get_frame_id (arv_buffer),
+				  received_ns ? (now_ns - (gint64) received_ns) / 1e6 : -1.0, n_output, n_filling, n_input);
+	}
 	chunk_source = arv_buffer;	/* alive until the end of create: held downstream or pushed back last */
 
 	buffer_data = (char *) arv_buffer_get_data (arv_buffer, &buffer_size);
